@@ -163,6 +163,11 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
+type BackgroundPromptConfig = {
+	prompt: string;
+	respond: boolean;
+};
+
 const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 	"Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
 
@@ -292,6 +297,9 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	private readonly backgroundPromptPath: string;
+	private backgroundPromptConfig: BackgroundPromptConfig | undefined;
+	private backgroundTaskPromise: Promise<void> | undefined;
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -368,6 +376,8 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.backgroundPromptPath = path.join(this.sessionManager.getCwd(), "BACKGROUND.md");
+		this.backgroundPromptConfig = this.loadBackgroundPrompt();
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -743,7 +753,7 @@ export class InteractiveMode {
 
 		// Main interactive loop
 		while (true) {
-			const userInput = await this.getUserInput();
+			const userInput = await this.waitForUserInputWithBackgroundWork();
 			try {
 				await this.session.prompt(userInput);
 			} catch (error: unknown) {
@@ -3175,6 +3185,50 @@ export class InteractiveMode {
 				resolve(text);
 			};
 		});
+	}
+
+	private loadBackgroundPrompt(): BackgroundPromptConfig | undefined {
+		try {
+			if (!fs.existsSync(this.backgroundPromptPath)) return undefined;
+			const rawContent = fs.readFileSync(this.backgroundPromptPath, "utf8").trim();
+			if (rawContent.length === 0) return undefined;
+			const lines = rawContent.split("\n");
+			const firstLine = lines[0]?.trim().toLowerCase();
+			const hasRespondDirective = firstLine === "respond: true" || firstLine === "respond: false";
+			const respond = firstLine === "respond: true";
+			const prompt = (hasRespondDirective ? lines.slice(1).join("\n") : rawContent).trim();
+			if (prompt.length === 0) return undefined;
+			return { prompt, respond };
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async waitForUserInputWithBackgroundWork(): Promise<string> {
+		const userInputPromise = this.getUserInput();
+
+		if (this.backgroundPromptConfig) {
+			this.backgroundTaskPromise = this.runBackgroundTask(this.backgroundPromptConfig);
+		}
+
+		const userInput = await userInputPromise;
+		if (this.backgroundTaskPromise) {
+			this.session.abort();
+			await this.backgroundTaskPromise;
+			this.backgroundTaskPromise = undefined;
+		}
+		return userInput;
+	}
+
+	private async runBackgroundTask(config: BackgroundPromptConfig): Promise<void> {
+		const backgroundPrompt = config.respond
+			? config.prompt
+			: `${config.prompt}\n\nDo not emit any user-visible response for this background run.`;
+		try {
+			await this.session.prompt(backgroundPrompt, { streamingBehavior: "steer", source: "background" });
+		} catch {
+			// Keep interactive mode responsive even if background work fails.
+		}
 	}
 
 	private rebuildChatFromMessages(): void {
